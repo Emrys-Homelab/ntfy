@@ -184,7 +184,9 @@ var (
 	errHTTPBadRequestUserNoPrimaryEmail              = &errHTTP{40067, http.StatusBadRequest, "invalid request: user has no primary email, cannot send reset link", "", nil, nil}
 	errHTTPBadRequestBaseURLNotConfigured            = &errHTTP{40068, http.StatusBadRequest, "invalid request: base-url must be configured on the server to generate links", "https://ntfy.sh/docs/config/", nil, nil}
 	errHTTPBadRequestPasswordHashInvalid             = &errHTTP{40069, http.StatusBadRequest, "invalid request: password hash must be a bcrypt hash with cost 10 or higher, use 'ntfy user hash' to generate", "", nil, nil}
+	errHTTPBadRequestMessageTooLarge                 = &errHTTP{40070, http.StatusBadRequest, "invalid request: message is too large", "https://ntfy.sh/docs/publish/#limitations", nil, nil}
 	errHTTPNotFound                                  = &errHTTP{40401, http.StatusNotFound, "page not found", "", nil, nil}
+	errHTTPMessageNotFound                           = &errHTTP{40402, http.StatusNotFound, "message not found", "", nil, nil}
 	errHTTPUnauthorized                              = &errHTTP{40101, http.StatusUnauthorized, "unauthorized", "https://ntfy.sh/docs/publish/#authentication", nil, nil}
 	errHTTPForbidden                                 = &errHTTP{40301, http.StatusForbidden, "forbidden", "https://ntfy.sh/docs/publish/#authentication", nil, nil}
 	errHTTPForbiddenAdminSocketOnly                  = &errHTTP{40302, http.StatusForbidden, "forbidden: this operation is only allowed over the local admin socket", "https://ntfy.sh/docs/config/#admin-socket", nil, nil}
@@ -198,6 +200,7 @@ var (
 	errHTTPConflictEmailPrimaryElsewhere             = &errHTTP{40908, http.StatusConflict, "conflict: email address is the primary email on another account", "", nil, nil}
 	errHTTPConflictTierExists                        = &errHTTP{40909, http.StatusConflict, "conflict: tier already exists", "", nil, nil}
 	errHTTPConflictTierInUse                         = &errHTTP{40910, http.StatusConflict, "conflict: tier is still assigned to users", "", nil, nil}
+	errHTTPConflictMessageRetracted                  = &errHTTP{40911, http.StatusConflict, "conflict: message has been retracted", "", nil, nil}
 	errHTTPGonePhoneVerificationExpired              = &errHTTP{41001, http.StatusGone, "phone number verification expired or does not exist", "", nil, nil}
 	errHTTPGoneUnifiedPushTopicAbandoned             = &errHTTP{41002, http.StatusGone, "UnifiedPush topic has had no subscriber for too long, subscription expired", "", nil, nil}
 	errHTTPEntityTooLargeAttachment                  = &errHTTP{41301, http.StatusRequestEntityTooLarge, "attachment too large, or bandwidth limit reached", "https://ntfy.sh/docs/publish/#limitations", nil, nil}

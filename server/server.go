@@ -77,6 +77,7 @@ type Server struct {
 	messagesFlushed   int64                               // Value of the messages counter at the last stats flush; the difference is written as a delta
 	userManager       *user.Manager                       // Might be nil!
 	messageCache      *message.Cache                      // Database that stores the messages
+	messageRegistry   *message.Registry                   // Durable message identity, read/ack state, update/retract; nil if not configured
 	webPush           *webpush.Store                      // Database that stores web push subscriptions
 	attachment        *attachment.Store                   // Attachment store (file system or S3)
 	stripe            stripeAPI                           // Stripe API, can be replaced with a mock
@@ -108,6 +109,7 @@ var (
 	updatePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}$`)
 	clearPathRegex         = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/(read|clear)$`)
 	deletePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/delete$`)
+	messageAPIPathRegex    = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})/([-_A-Za-z0-9]{1,64})(/ack)?$`)
 	sequenceIDRegex        = topicRegex
 
 	webAppConfigPath              = "/config.js"
@@ -241,6 +243,14 @@ func New(conf *Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	var msgRegistry *message.Registry
+	if conf.MessageRegistryFile != "" {
+		msgRegistry, err = message.NewRegistry(conf.MessageRegistryFile, conf.MessageRegistryDuration)
+		if err != nil {
+			messageCache.Close()
+			return nil, err
+		}
+	}
 	var wp *webpush.Store
 	if conf.WebPushPublicKey != "" {
 		if pool != nil {
@@ -298,6 +308,7 @@ func New(conf *Config) (*Server, error) {
 		config:          conf,
 		db:              pool,
 		messageCache:    messageCache,
+		messageRegistry: msgRegistry,
 		webPush:         wp,
 		attachment:      attachmentStore,
 		twilio:          twilioClient,
@@ -677,6 +688,9 @@ func (s *Server) closeDatabases() {
 	if s.messageCache != nil {
 		s.messageCache.Close()
 	}
+	if s.messageRegistry != nil {
+		s.messageRegistry.Close()
+	}
 	if s.userManager != nil {
 		s.userManager.Close()
 	}
@@ -877,6 +891,8 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, v *visit
 		return s.ensureWebPushEnabled(s.limitRequests(s.handleWebPushDelete))(w, r, v)
 	} else if r.Method == http.MethodGet && r.URL.Path == apiStatsPath {
 		return s.handleStats(w, r, v)
+	} else if messageAPIPathRegex.MatchString(r.URL.Path) {
+		return s.limitRequests(s.handleMessageAPI)(w, r, v)
 	} else if r.Method == http.MethodGet && r.URL.Path == apiAccountBillingTiersPath {
 		return s.ensurePaymentsEnabled(s.handleBillingTiersGet)(w, r, v)
 	} else if r.Method == http.MethodGet && r.URL.Path == apiTiersPath {
@@ -1229,6 +1245,11 @@ func (s *Server) handlePublishInternal(w http.ResponseWriter, r *http.Request, v
 	s.mu.Lock()
 	s.messages++
 	s.mu.Unlock()
+	if s.messageRegistry != nil && m.Event == model.MessageEvent && !delayed {
+		if _, err := s.messageRegistry.Put(m); err != nil {
+			logvrm(v, r, m).Tag(tagPublish).Err(err).Warn("Unable to record message identity")
+		}
+	}
 	if unifiedpush {
 		metrics.UnifiedPushPublishedSuccess.Inc()
 	}
@@ -1243,6 +1264,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, v *visito
 		return err
 	}
 	metrics.MessagesPublishedSuccess.Inc()
+	w.Header().Set("X-Ntfy-Sequence-ID", m.SequenceID)
 	return s.writeJSON(w, m.ForJSON())
 }
 
@@ -2344,6 +2366,11 @@ func (s *Server) sendDelayedMessage(v *visitor, m *model.Message) error {
 	}
 	if err := s.messageCache.MarkPublished(m); err != nil {
 		return err
+	}
+	if s.messageRegistry != nil && m.Event == model.MessageEvent {
+		if _, err := s.messageRegistry.Put(m); err != nil {
+			logvm(v, m).Err(err).Warn("Unable to record message identity")
+		}
 	}
 	return nil
 }

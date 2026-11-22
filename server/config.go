@@ -21,6 +21,7 @@ const (
 	DefaultListenAdminUnixMode                  = fs.FileMode(0660) // Owner (the ntfy user) and the ntfy group; root bypasses anyway
 	DefaultListenHTTP                           = ":80"
 	DefaultCacheDuration                        = 12 * time.Hour
+	DefaultMessageRegistryDuration              = 30 * 24 * time.Hour // A message identity outlives the cache's 12h default by a wide margin
 	DefaultCacheBatchTimeout                    = time.Duration(0)
 	DefaultKeepaliveInterval                    = 45 * time.Second // Not too frequently to save battery (Android read timeout used to be 77s!)
 	DefaultManagerInterval                      = time.Minute
@@ -153,6 +154,8 @@ type Config struct {
 	CacheStartupQueries                  string
 	CacheBatchSize                       int
 	CacheBatchTimeout                    time.Duration
+	MessageRegistryFile                  string        // SQLite file for durable message identity, read/ack state and update/retract; empty disables the API
+	MessageRegistryDuration              time.Duration // How long an identity stays addressable, independent of CacheDuration
 	AuthFile                             string
 	AuthStartupQueries                   string
 	AuthDefault                          user.Permission
@@ -294,6 +297,8 @@ func NewConfig() *Config {
 		CacheStartupQueries:                  "",
 		CacheBatchSize:                       0,
 		CacheBatchTimeout:                    0,
+		MessageRegistryFile:                  "",
+		MessageRegistryDuration:              DefaultMessageRegistryDuration,
 		AuthFile:                             "",
 		AuthStartupQueries:                   "",
 		AuthDefault:                          user.PermissionReadWrite,
