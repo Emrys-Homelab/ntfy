@@ -131,11 +131,11 @@ type Attachment struct {
 // Action represents a user-defined action on a message
 type Action struct {
 	ID      string            `json:"id"`
-	Action  string            `json:"action"`            // "view", "broadcast", "http", or "copy"
+	Action  string            `json:"action"`            // "view", "broadcast", "http", "copy", or "reply"
 	Label   string            `json:"label"`             // action button label
 	Clear   bool              `json:"clear"`             // clear notification after successful execution
-	URL     string            `json:"url,omitempty"`     // used in "view" and "http" actions
-	Method  string            `json:"method,omitempty"`  // used in "http" action, default is POST (!)
+	URL     string            `json:"url,omitempty"`     // used in "view", "http" and "reply" actions
+	Method  string            `json:"method,omitempty"`  // used in "http" and "reply" actions, default is POST (!)
 	Headers map[string]string `json:"headers,omitempty"` // used in "http" action
 	Body    string            `json:"body,omitempty"`    // used in "http" action
 	Intent  string            `json:"intent,omitempty"`  // used in "broadcast" action

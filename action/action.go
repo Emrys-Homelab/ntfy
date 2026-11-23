@@ -25,12 +25,13 @@ const (
 	actionBroadcast = "broadcast"
 	actionHTTP      = "http"
 	actionCopy      = "copy"
+	actionReply     = "reply"
 )
 
 var (
-	actionsAll       = []string{actionView, actionBroadcast, actionHTTP, actionCopy}
-	actionsWithURL   = []string{actionView, actionHTTP} // Must be distinct from actionsWithValue, see populateAction()
-	actionsWithValue = []string{actionCopy}             // Must be distinct from actionsWithURL, see populateAction()
+	actionsAll       = []string{actionView, actionBroadcast, actionHTTP, actionCopy, actionReply}
+	actionsWithURL   = []string{actionView, actionHTTP, actionReply} // Must be distinct from actionsWithValue, see populateAction()
+	actionsWithValue = []string{actionCopy}                          // Must be distinct from actionsWithURL, see populateAction()
 	actionsKeyRegex  = regexp.MustCompile(`^([-.\w]+)\s*=\s*`)
 )
 
@@ -59,6 +60,9 @@ func Parse(s string) (actions []*model.Action, err error) {
 		actions[i].ID = util.RandomString(actionIDLength)
 		actions[i].Action = strings.ToLower(actions[i].Action)
 		actions[i].Method = strings.ToUpper(actions[i].Method)
+		if actions[i].Action == actionReply && actions[i].Method == "" {
+			actions[i].Method = "POST"
+		}
 	}
 
 	// Validate
@@ -67,7 +71,7 @@ func Parse(s string) (actions []*model.Action, err error) {
 	}
 	for _, action := range actions {
 		if !util.Contains(actionsAll, action.Action) {
-			return nil, fmt.Errorf("parameter 'action' cannot be '%s', valid values are 'view', 'broadcast', 'http' and 'copy'", action.Action)
+			return nil, fmt.Errorf("parameter 'action' cannot be '%s', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'", action.Action)
 		} else if action.Label == "" {
 			return nil, fmt.Errorf("parameter 'label' is required")
 		} else if util.Contains(actionsWithURL, action.Action) && action.URL == "" {
@@ -76,6 +80,10 @@ func Parse(s string) (actions []*model.Action, err error) {
 			return nil, fmt.Errorf("parameter 'value' is required for action '%s'", action.Action)
 		} else if action.Action == actionHTTP && util.Contains([]string{"GET", "HEAD"}, action.Method) && action.Body != "" {
 			return nil, fmt.Errorf("parameter 'body' cannot be set if method is %s", action.Method)
+		} else if action.Action == actionReply && action.Method != "POST" {
+			return nil, fmt.Errorf("parameter 'method' must be POST for action 'reply'")
+		} else if action.Action == actionReply && action.Body != "" {
+			return nil, fmt.Errorf("parameter 'body' cannot be set for action 'reply'")
 		}
 	}
 

@@ -171,6 +171,43 @@ func TestParseActions(t *testing.T) {
 	_, err = Parse("copy, Copy code")
 	require.EqualError(t, err, "parameter 'value' is required for action 'copy'")
 
+	// Reply action (JSON) - url, method and headers are the existing fields
+	actions, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","method":"POST","headers":{"X-Topic":"homelab-inbox"}}]`)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(actions))
+	require.Equal(t, "reply", actions[0].Action)
+	require.Equal(t, "Reply", actions[0].Label)
+	require.Equal(t, "https://notify.emrys.dev/v1/reply", actions[0].URL)
+	require.Equal(t, "POST", actions[0].Method)
+	require.Equal(t, "homelab-inbox", actions[0].Headers["X-Topic"])
+	require.False(t, actions[0].Clear)
+
+	// Reply action defaults the method to POST
+	actions, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply"}]`)
+	require.Nil(t, err)
+	require.Equal(t, "POST", actions[0].Method)
+
+	// Reply action (simple format), with clear
+	actions, err = Parse("action=reply, label=Reply, url=https://notify.emrys.dev/v1/reply, clear=true, headers.X-Topic=homelab-inbox")
+	require.Nil(t, err)
+	require.Equal(t, 1, len(actions))
+	require.Equal(t, "reply", actions[0].Action)
+	require.Equal(t, "POST", actions[0].Method)
+	require.Equal(t, "homelab-inbox", actions[0].Headers["X-Topic"])
+	require.True(t, actions[0].Clear)
+
+	// Reply action without url (error)
+	_, err = Parse(`[{"action":"reply","label":"Reply"}]`)
+	require.EqualError(t, err, "parameter 'url' is required for action 'reply'")
+
+	// Reply action that is not a POST (error)
+	_, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","method":"GET"}]`)
+	require.EqualError(t, err, "parameter 'method' must be POST for action 'reply'")
+
+	// Reply action with a body (error)
+	_, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","body":"x"}]`)
+	require.EqualError(t, err, "parameter 'body' cannot be set for action 'reply'")
+
 	// Invalid syntax
 	_, err = Parse(`label="Out of order!" x, action="http", url=http://example.com`)
 	require.EqualError(t, err, "unexpected character 'x' at position 22")
@@ -185,7 +222,7 @@ func TestParseActions(t *testing.T) {
 	require.EqualError(t, err, "term 'what is this anyway' unknown")
 
 	_, err = Parse(`fdsfdsf`)
-	require.EqualError(t, err, "parameter 'action' cannot be 'fdsfdsf', valid values are 'view', 'broadcast', 'http' and 'copy'")
+	require.EqualError(t, err, "parameter 'action' cannot be 'fdsfdsf', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'")
 
 	_, err = Parse(`aaa=a, "bbb, 'ccc, ddd, eee "`)
 	require.EqualError(t, err, "key 'aaa' unknown")
@@ -212,7 +249,7 @@ func TestParseActions(t *testing.T) {
 	require.EqualError(t, err, "JSON error: invalid character 'i' looking for beginning of value")
 
 	_, err = Parse(`[ { "some": "object" } ]`)
-	require.EqualError(t, err, "parameter 'action' cannot be '', valid values are 'view', 'broadcast', 'http' and 'copy'")
+	require.EqualError(t, err, "parameter 'action' cannot be '', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'")
 
 	_, err = Parse("\x00\x01\xFFx\xFE")
 	require.EqualError(t, err, "invalid utf-8 string")
