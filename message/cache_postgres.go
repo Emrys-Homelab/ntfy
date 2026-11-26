@@ -21,6 +21,7 @@ const (
 	`
 	postgresSelectScheduledMessageIDsBySeqIDQuery = `SELECT mid FROM message WHERE topic = $1 AND sequence_id = $2 AND published = FALSE`
 	postgresDeleteScheduledBySequenceIDQuery      = `DELETE FROM message WHERE topic = $1 AND sequence_id = $2 AND published = FALSE`
+	postgresDeleteBySequenceIDQuery               = `DELETE FROM message WHERE topic = $1 AND sequence_id = $2 AND event = 'message'`
 	postgresUpdateMessagesForTopicExpiryQuery     = `UPDATE message SET expires = $1 WHERE topic = $2`
 	postgresSelectMessagesByIDQuery               = `
 		SELECT mid, sequence_id, time, event, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user_id, content_type, encoding
@@ -132,6 +133,7 @@ var postgresQueries = queries{
 	insertMessages:                   postgresInsertMessages,
 	selectScheduledMessageIDsBySeqID: postgresSelectScheduledMessageIDsBySeqIDQuery,
 	deleteScheduledBySequenceID:      postgresDeleteScheduledBySequenceIDQuery,
+	deleteBySequenceID:               postgresDeleteBySequenceIDQuery,
 	updateMessagesForTopicExpiry:     postgresUpdateMessagesForTopicExpiryQuery,
 	selectMessagesByID:               postgresSelectMessagesByIDQuery,
 	selectMessagesSinceTime:          postgresSelectMessagesSinceTimeQuery,

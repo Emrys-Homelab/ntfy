@@ -55,6 +55,7 @@ type queries struct {
 	insertMessages                   func(tx *sql.Tx, ms []*model.Message) error // Writes a batch of messages in as few statements as possible
 	selectScheduledMessageIDsBySeqID string
 	deleteScheduledBySequenceID      string
+	deleteBySequenceID               string
 	updateMessagesForTopicExpiry     string
 	selectMessagesByID               string
 	selectMessagesSinceTime          string
@@ -506,6 +507,26 @@ func (c *Cache) DeleteScheduledBySequenceID(topic, sequenceID string) ([]string,
 		}
 		return ids, nil
 	})
+}
+
+// DeleteBySequenceID removes every stored revision of one message from the cache and returns the
+// number of rows deleted. It is the storage half of a retract: the registry tombstone survives, the
+// message bytes do not, so a client that subscribes afterwards cannot replay what was deleted.
+// Every revision is removed because a sequence ID is one logical message (an update republishes
+// under the same sequence ID), and delete-by-sequence-id on the client removes all of its rows.
+//
+// Only event='message' rows are removed. The message_clear and message_delete action rows carry
+// the same sequence ID and are how a client that replays the topic learns the message is gone:
+// deleting them would erase the very signal being published. A replayed DELETE therefore finds no
+// message row, emits nothing, and leaves the one delete event in place.
+func (c *Cache) DeleteBySequenceID(topic, sequenceID string) (int64, error) {
+	c.maybeLock()
+	defer c.maybeUnlock()
+	result, err := c.db.Exec(c.queries.deleteBySequenceID, topic, sequenceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // ExpireMessages marks messages in the given topics as expired

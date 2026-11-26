@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"heckel.io/ntfy/v2/message"
@@ -18,9 +19,10 @@ import (
 // so an update can be *decided* by the server instead of guessed by a client.
 //
 //	GET    /v1/messages/<topic>/<identity>        read the durable state (read permission)
+//	GET    /v1/messages/<topic>                   list the topic's cached messages (read permission)
 //	PATCH  /v1/messages/<topic>/<identity>        update; replace if unread, re-alert if read (write)
 //	PUT    /v1/messages/<topic>/<identity>        same as PATCH (write)
-//	DELETE /v1/messages/<topic>/<identity>        retract; remove if unread, log-only if read (write)
+//	DELETE /v1/messages/<topic>/<identity>        retract; remove from the cache and tell clients (write)
 //	POST   /v1/messages/<topic>/<identity>/ack    mark read/acknowledged (read permission)
 //
 // <identity> is the message's sequence ID, which is the identity stock ntfy already puts on the
@@ -34,6 +36,7 @@ const (
 type messageAPIResponse struct {
 	*message.MessageState
 	Disposition string `json:"disposition,omitempty"`
+	RemovedRows int64  `json:"removed_rows,omitempty"`
 }
 
 // messageUpdateRequest carries the fields an update may change. Pointers distinguish "not
@@ -57,6 +60,16 @@ func (s *Server) handleMessageAPI(w http.ResponseWriter, r *http.Request, v *vis
 		return errHTTPNotFound // The feature is off unless message-registry-file is configured
 	}
 	topic, identity, ack := splitMessageAPIPath(r.URL.Path)
+	if topic != "" && identity == "" {
+		// GET /v1/messages/<topic>: the topic's cached messages, not an identity.
+		if r.Method != http.MethodGet {
+			return errHTTPNotFound
+		}
+		if err := s.authorizeMessageTopic(v, topic, user.PermissionRead); err != nil {
+			return err
+		}
+		return s.handleMessageList(w, topic)
+	}
 	if topic == "" || identity == "" {
 		return errHTTPNotFound
 	}
@@ -85,8 +98,12 @@ func (s *Server) handleMessageAPI(w http.ResponseWriter, r *http.Request, v *vis
 	return errHTTPNotFound
 }
 
-// splitMessageAPIPath returns the topic, identity and whether the path ends in /ack.
+// splitMessageAPIPath returns the topic, identity and whether the path ends in /ack. A path with
+// only a topic (GET /v1/messages/<topic>) has an empty identity.
 func splitMessageAPIPath(path string) (string, string, bool) {
+	if messageAPITopicRegex.MatchString(path) {
+		return strings.TrimPrefix(path, messageAPIPathPrefix), "", false
+	}
 	if !messageAPIPathRegex.MatchString(path) {
 		return "", "", false
 	}
@@ -116,6 +133,21 @@ func (s *Server) handleMessageGet(w http.ResponseWriter, topic, identity string)
 		return err
 	}
 	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "state"})
+}
+
+// handleMessageList returns the topic's cached messages, oldest first: the same rows a subscriber
+// replays from GET /<topic>/json, and the server-side truth a DELETE is checked against. A
+// retracted message must not appear here, while its identity remains in the registry as a
+// tombstone (so a repeated DELETE is answered without resurrecting it).
+func (s *Server) handleMessageList(w http.ResponseWriter, topic string) error {
+	messages, err := s.messageCache.Messages(topic, model.SinceAllMessages, false)
+	if err != nil {
+		return err
+	}
+	return s.writeJSON(w, map[string]any{
+		"topic":    topic,
+		"messages": messages,
+	})
 }
 
 func (s *Server) handleMessageAck(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
@@ -237,32 +269,46 @@ func (s *Server) handleMessageUpdate(w http.ResponseWriter, r *http.Request, v *
 	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
 }
 
+// handleMessageRetract removes a message for good. DELETE has to mean "it is gone": the row is
+// removed from the topic cache, so a client that subscribes afterwards cannot replay it, and a
+// message_delete event is published so a client that already has it (the phone's list, the
+// notification shade) removes it too. The read/unread distinction is deliberately gone: the old
+// behaviour published the event only for an unread message and kept a read one as a silent log
+// line, which is exactly what left a "resolved" entry in the app's medium list with no way to
+// clear it.
+//
+// Order matters. The cache row goes first: if the event went out first and the delete then failed,
+// a fresh subscriber would still replay the message the event said was gone. The registry is
+// marked retracted last, so a failed dispatch leaves the identity active and the caller's retry
+// repeats the (idempotent) delete and event instead of short-circuiting on a tombstone.
 func (s *Server) handleMessageRetract(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
 	st, err := s.messageRegistry.Get(topic, identity)
 	if errors.Is(err, message.ErrMessageNotFound) {
 		return errHTTPMessageNotFound
 	} else if err != nil {
 		return err
-	} else if st.State == message.RegistryStateRetracted {
-		return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "already_retracted"})
 	}
-	read := st.Read
-	if !read {
-		// Unread: the stock delete event removes it from the notification shade. Read: no event is
-		// published at all, so it stays a silent log line in the app instead of re-notifying.
+	removed, err := s.messageCache.DeleteBySequenceID(topic, identity)
+	if err != nil {
+		return err
+	}
+	// A tombstone with no cached row and no new deletion is a replay of the same DELETE: the event
+	// has already gone out, so do not send a second one. Every other case means something was
+	// actually removed (now, or by the old log-only path) and clients still need telling.
+	if st.State != message.RegistryStateRetracted || removed > 0 {
 		if err := s.publishActionMessage(v, topic, identity, model.MessageDeleteEvent); err != nil {
 			return err
 		}
 	}
-	st, err = s.messageRegistry.MarkRetracted(topic, identity, read)
+	st, err = s.messageRegistry.MarkRetracted(topic, identity, st.Read)
 	if err != nil {
 		return err
 	}
-	disposition := "removed"
-	if read {
-		disposition = "log_only"
-	}
-	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
+	return s.writeJSON(w, &messageAPIResponse{
+		MessageState: st,
+		Disposition:  "removed",
+		RemovedRows:  removed,
+	})
 }
 
 // publishActionMessage publishes a stock message_clear or message_delete event for an identity.

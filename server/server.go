@@ -110,6 +110,7 @@ var (
 	clearPathRegex         = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/(read|clear)$`)
 	deletePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/delete$`)
 	messageAPIPathRegex    = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})/([-_A-Za-z0-9]{1,64})(/ack)?$`)
+	messageAPITopicRegex   = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})$`)
 	sequenceIDRegex        = topicRegex
 
 	webAppConfigPath              = "/config.js"
@@ -891,7 +892,7 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, v *visit
 		return s.ensureWebPushEnabled(s.limitRequests(s.handleWebPushDelete))(w, r, v)
 	} else if r.Method == http.MethodGet && r.URL.Path == apiStatsPath {
 		return s.handleStats(w, r, v)
-	} else if messageAPIPathRegex.MatchString(r.URL.Path) {
+	} else if messageAPIPathRegex.MatchString(r.URL.Path) || messageAPITopicRegex.MatchString(r.URL.Path) {
 		return s.limitRequests(s.handleMessageAPI)(w, r, v)
 	} else if r.Method == http.MethodGet && r.URL.Path == apiAccountBillingTiersPath {
 		return s.ensurePaymentsEnabled(s.handleBillingTiersGet)(w, r, v)
