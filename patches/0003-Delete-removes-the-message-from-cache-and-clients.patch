@@ -1,0 +1,346 @@
+From 442eaf11716bee249a530a2aa163630204fa18f2 Mon Sep 17 00:00:00 2001
+From: Emrys Homelab <homelab@emrys.dev>
+Date: Thu, 26 Nov 2026 17:10:48 -0600
+Subject: [PATCH] DELETE removes the message from cache and clients
+
+---
+ message/cache.go           | 21 ++++++++++
+ message/cache_postgres.go  |  2 +
+ message/cache_sqlite.go    |  2 +
+ server/message_api.go      | 74 +++++++++++++++++++++++++++++-------
+ server/message_api_test.go | 78 ++++++++++++++++++++++++++++++++++++++
+ server/server.go           |  3 +-
+ 6 files changed, 165 insertions(+), 15 deletions(-)
+ create mode 100644 server/message_api_test.go
+
+diff --git a/message/cache.go b/message/cache.go
+index f1ab54b3..ab27756b 100644
+--- a/message/cache.go
++++ b/message/cache.go
+@@ -55,6 +55,7 @@ type queries struct {
+ 	insertMessages                   func(tx *sql.Tx, ms []*model.Message) error // Writes a batch of messages in as few statements as possible
+ 	selectScheduledMessageIDsBySeqID string
+ 	deleteScheduledBySequenceID      string
++	deleteBySequenceID               string
+ 	updateMessagesForTopicExpiry     string
+ 	selectMessagesByID               string
+ 	selectMessagesSinceTime          string
+@@ -508,6 +509,26 @@ func (c *Cache) DeleteScheduledBySequenceID(topic, sequenceID string) ([]string,
+ 	})
+ }
+ 
++// DeleteBySequenceID removes every stored revision of one message from the cache and returns the
++// number of rows deleted. It is the storage half of a retract: the registry tombstone survives, the
++// message bytes do not, so a client that subscribes afterwards cannot replay what was deleted.
++// Every revision is removed because a sequence ID is one logical message (an update republishes
++// under the same sequence ID), and delete-by-sequence-id on the client removes all of its rows.
++//
++// Only event='message' rows are removed. The message_clear and message_delete action rows carry
++// the same sequence ID and are how a client that replays the topic learns the message is gone:
++// deleting them would erase the very signal being published. A replayed DELETE therefore finds no
++// message row, emits nothing, and leaves the one delete event in place.
++func (c *Cache) DeleteBySequenceID(topic, sequenceID string) (int64, error) {
++	c.maybeLock()
++	defer c.maybeUnlock()
++	result, err := c.db.Exec(c.queries.deleteBySequenceID, topic, sequenceID)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected()
++}
++
+ // ExpireMessages marks messages in the given topics as expired
+ func (c *Cache) ExpireMessages(topics ...string) error {
+ 	c.maybeLock()
+diff --git a/message/cache_postgres.go b/message/cache_postgres.go
+index be19bdeb..0727ddaa 100644
+--- a/message/cache_postgres.go
++++ b/message/cache_postgres.go
+@@ -21,6 +21,7 @@ const (
+ 	`
+ 	postgresSelectScheduledMessageIDsBySeqIDQuery = `SELECT mid FROM message WHERE topic = $1 AND sequence_id = $2 AND published = FALSE`
+ 	postgresDeleteScheduledBySequenceIDQuery      = `DELETE FROM message WHERE topic = $1 AND sequence_id = $2 AND published = FALSE`
++	postgresDeleteBySequenceIDQuery               = `DELETE FROM message WHERE topic = $1 AND sequence_id = $2 AND event = 'message'`
+ 	postgresUpdateMessagesForTopicExpiryQuery     = `UPDATE message SET expires = $1 WHERE topic = $2`
+ 	postgresSelectMessagesByIDQuery               = `
+ 		SELECT mid, sequence_id, time, event, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user_id, content_type, encoding
+@@ -132,6 +133,7 @@ var postgresQueries = queries{
+ 	insertMessages:                   postgresInsertMessages,
+ 	selectScheduledMessageIDsBySeqID: postgresSelectScheduledMessageIDsBySeqIDQuery,
+ 	deleteScheduledBySequenceID:      postgresDeleteScheduledBySequenceIDQuery,
++	deleteBySequenceID:               postgresDeleteBySequenceIDQuery,
+ 	updateMessagesForTopicExpiry:     postgresUpdateMessagesForTopicExpiryQuery,
+ 	selectMessagesByID:               postgresSelectMessagesByIDQuery,
+ 	selectMessagesSinceTime:          postgresSelectMessagesSinceTimeQuery,
+diff --git a/message/cache_sqlite.go b/message/cache_sqlite.go
+index 6219f827..c2c2060f 100644
+--- a/message/cache_sqlite.go
++++ b/message/cache_sqlite.go
+@@ -26,6 +26,7 @@ const (
+ 
+ 	sqliteSelectScheduledMessageIDsBySeqIDQuery = `SELECT mid FROM messages WHERE topic = ? AND sequence_id = ? AND published = 0`
+ 	sqliteDeleteScheduledBySequenceIDQuery      = `DELETE FROM messages WHERE topic = ? AND sequence_id = ? AND published = 0`
++	sqliteDeleteBySequenceIDQuery               = `DELETE FROM messages WHERE topic = ? AND sequence_id = ? AND event = 'message'`
+ 	sqliteUpdateMessagesForTopicExpiryQuery     = `UPDATE messages SET expires = ? WHERE topic = ?`
+ 	sqliteSelectMessagesByIDQuery               = `
+ 		SELECT mid, sequence_id, time, event, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
+@@ -110,6 +111,7 @@ var sqliteQueries = queries{
+ 	insertMessages:                   sqliteInsertMessages,
+ 	selectScheduledMessageIDsBySeqID: sqliteSelectScheduledMessageIDsBySeqIDQuery,
+ 	deleteScheduledBySequenceID:      sqliteDeleteScheduledBySequenceIDQuery,
++	deleteBySequenceID:               sqliteDeleteBySequenceIDQuery,
+ 	updateMessagesForTopicExpiry:     sqliteUpdateMessagesForTopicExpiryQuery,
+ 	selectMessagesByID:               sqliteSelectMessagesByIDQuery,
+ 	selectMessagesSinceTime:          sqliteSelectMessagesSinceTimeQuery,
+diff --git a/server/message_api.go b/server/message_api.go
+index a4a6347f..40cf4789 100644
+--- a/server/message_api.go
++++ b/server/message_api.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"net/http"
++	"strings"
+ 	"time"
+ 
+ 	"heckel.io/ntfy/v2/message"
+@@ -18,9 +19,10 @@ import (
+ // so an update can be *decided* by the server instead of guessed by a client.
+ //
+ //	GET    /v1/messages/<topic>/<identity>        read the durable state (read permission)
++//	GET    /v1/messages/<topic>                   list the topic's cached messages (read permission)
+ //	PATCH  /v1/messages/<topic>/<identity>        update; replace if unread, re-alert if read (write)
+ //	PUT    /v1/messages/<topic>/<identity>        same as PATCH (write)
+-//	DELETE /v1/messages/<topic>/<identity>        retract; remove if unread, log-only if read (write)
++//	DELETE /v1/messages/<topic>/<identity>        retract; remove from the cache and tell clients (write)
+ //	POST   /v1/messages/<topic>/<identity>/ack    mark read/acknowledged (read permission)
+ //
+ // <identity> is the message's sequence ID, which is the identity stock ntfy already puts on the
+@@ -34,6 +36,7 @@ const (
+ type messageAPIResponse struct {
+ 	*message.MessageState
+ 	Disposition string `json:"disposition,omitempty"`
++	RemovedRows int64  `json:"removed_rows,omitempty"`
+ }
+ 
+ // messageUpdateRequest carries the fields an update may change. Pointers distinguish "not
+@@ -57,6 +60,16 @@ func (s *Server) handleMessageAPI(w http.ResponseWriter, r *http.Request, v *vis
+ 		return errHTTPNotFound // The feature is off unless message-registry-file is configured
+ 	}
+ 	topic, identity, ack := splitMessageAPIPath(r.URL.Path)
++	if topic != "" && identity == "" {
++		// GET /v1/messages/<topic>: the topic's cached messages, not an identity.
++		if r.Method != http.MethodGet {
++			return errHTTPNotFound
++		}
++		if err := s.authorizeMessageTopic(v, topic, user.PermissionRead); err != nil {
++			return err
++		}
++		return s.handleMessageList(w, topic)
++	}
+ 	if topic == "" || identity == "" {
+ 		return errHTTPNotFound
+ 	}
+@@ -85,8 +98,12 @@ func (s *Server) handleMessageAPI(w http.ResponseWriter, r *http.Request, v *vis
+ 	return errHTTPNotFound
+ }
+ 
+-// splitMessageAPIPath returns the topic, identity and whether the path ends in /ack.
++// splitMessageAPIPath returns the topic, identity and whether the path ends in /ack. A path with
++// only a topic (GET /v1/messages/<topic>) has an empty identity.
+ func splitMessageAPIPath(path string) (string, string, bool) {
++	if messageAPITopicRegex.MatchString(path) {
++		return strings.TrimPrefix(path, messageAPIPathPrefix), "", false
++	}
+ 	if !messageAPIPathRegex.MatchString(path) {
+ 		return "", "", false
+ 	}
+@@ -118,6 +135,21 @@ func (s *Server) handleMessageGet(w http.ResponseWriter, topic, identity string)
+ 	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "state"})
+ }
+ 
++// handleMessageList returns the topic's cached messages, oldest first: the same rows a subscriber
++// replays from GET /<topic>/json, and the server-side truth a DELETE is checked against. A
++// retracted message must not appear here, while its identity remains in the registry as a
++// tombstone (so a repeated DELETE is answered without resurrecting it).
++func (s *Server) handleMessageList(w http.ResponseWriter, topic string) error {
++	messages, err := s.messageCache.Messages(topic, model.SinceAllMessages, false)
++	if err != nil {
++		return err
++	}
++	return s.writeJSON(w, map[string]any{
++		"topic":    topic,
++		"messages": messages,
++	})
++}
++
+ func (s *Server) handleMessageAck(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
+ 	st, err := s.messageRegistry.Get(topic, identity)
+ 	if errors.Is(err, message.ErrMessageNotFound) {
+@@ -237,32 +269,46 @@ func (s *Server) handleMessageUpdate(w http.ResponseWriter, r *http.Request, v *
+ 	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
+ }
+ 
++// handleMessageRetract removes a message for good. DELETE has to mean "it is gone": the row is
++// removed from the topic cache, so a client that subscribes afterwards cannot replay it, and a
++// message_delete event is published so a client that already has it (the phone's list, the
++// notification shade) removes it too. The read/unread distinction is deliberately gone: the old
++// behaviour published the event only for an unread message and kept a read one as a silent log
++// line, which is exactly what left a "resolved" entry in the app's medium list with no way to
++// clear it.
++//
++// Order matters. The cache row goes first: if the event went out first and the delete then failed,
++// a fresh subscriber would still replay the message the event said was gone. The registry is
++// marked retracted last, so a failed dispatch leaves the identity active and the caller's retry
++// repeats the (idempotent) delete and event instead of short-circuiting on a tombstone.
+ func (s *Server) handleMessageRetract(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
+ 	st, err := s.messageRegistry.Get(topic, identity)
+ 	if errors.Is(err, message.ErrMessageNotFound) {
+ 		return errHTTPMessageNotFound
+ 	} else if err != nil {
+ 		return err
+-	} else if st.State == message.RegistryStateRetracted {
+-		return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "already_retracted"})
+ 	}
+-	read := st.Read
+-	if !read {
+-		// Unread: the stock delete event removes it from the notification shade. Read: no event is
+-		// published at all, so it stays a silent log line in the app instead of re-notifying.
++	removed, err := s.messageCache.DeleteBySequenceID(topic, identity)
++	if err != nil {
++		return err
++	}
++	// A tombstone with no cached row and no new deletion is a replay of the same DELETE: the event
++	// has already gone out, so do not send a second one. Every other case means something was
++	// actually removed (now, or by the old log-only path) and clients still need telling.
++	if st.State != message.RegistryStateRetracted || removed > 0 {
+ 		if err := s.publishActionMessage(v, topic, identity, model.MessageDeleteEvent); err != nil {
+ 			return err
+ 		}
+ 	}
+-	st, err = s.messageRegistry.MarkRetracted(topic, identity, read)
++	st, err = s.messageRegistry.MarkRetracted(topic, identity, st.Read)
+ 	if err != nil {
+ 		return err
+ 	}
+-	disposition := "removed"
+-	if read {
+-		disposition = "log_only"
+-	}
+-	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
++	return s.writeJSON(w, &messageAPIResponse{
++		MessageState: st,
++		Disposition:  "removed",
++		RemovedRows:  removed,
++	})
+ }
+ 
+ // publishActionMessage publishes a stock message_clear or message_delete event for an identity.
+diff --git a/server/message_api_test.go b/server/message_api_test.go
+new file mode 100644
+index 00000000..5054d9d6
+--- /dev/null
++++ b/server/message_api_test.go
+@@ -0,0 +1,78 @@
++package server
++
++import (
++	"encoding/json"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"heckel.io/ntfy/v2/message"
++	"heckel.io/ntfy/v2/model"
++)
++
++// TestServer_MessageAPI_DeleteRemovesReadMessage is the contract a resolution relies on: DELETE
++// means gone. The message is published, marked read (the ack hook the phone calls when the operator
++// opens or dismisses it), and then deleted - the case that used to be log-only and left the row in
++// the topic cache. After the delete the cache must hold no message row for the identity, only the
++// message_delete event clients need, and the registry must answer with a retracted tombstone.
++func TestServer_MessageAPI_DeleteRemovesReadMessage(t *testing.T) {
++	forEachBackend(t, func(t *testing.T, databaseURL string) {
++		c := newTestConfig(t, databaseURL)
++		c.MessageRegistryFile = filepath.Join(t.TempDir(), "registry.db")
++		s := newTestServer(t, c)
++
++		response := request(t, s, "POST", "/", `{"topic":"mytopic","title":"WARNING: thing","message":"it broke","priority":3,"sequence_id":"seq-1"}`, map[string]string{"Content-Type": "application/json"})
++		require.Equal(t, 200, response.Code)
++		require.Equal(t, "seq-1", toMessage(t, response.Body.String()).SequenceID)
++
++		response = request(t, s, "POST", "/v1/messages/mytopic/seq-1/ack", "", nil)
++		require.Equal(t, 200, response.Code)
++
++		messages := messageAPIMessages(t, s, "mytopic")
++		require.Len(t, messages, 2) // the message and the message_clear the ack published
++		require.Equal(t, model.MessageEvent, messages[0].Event)
++
++		response = request(t, s, "DELETE", "/v1/messages/mytopic/seq-1", "", nil)
++		require.Equal(t, 200, response.Code)
++		var deleted messageAPIResponse
++		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &deleted))
++		require.Equal(t, "removed", deleted.Disposition)
++		// Only the message row goes: the message_clear the ack published stays, with the new
++		// message_delete, so a client replaying the topic still learns what happened.
++		require.EqualValues(t, 1, deleted.RemovedRows)
++		require.Equal(t, message.RegistryStateRetracted, deleted.State)
++
++		messages = messageAPIMessages(t, s, "mytopic")
++		for _, m := range messages {
++			require.NotEqual(t, model.MessageEvent, m.Event, "the deleted message must not remain in the cache")
++		}
++
++		// The identity is still addressable as a tombstone, so the client learns it was retracted.
++		response = request(t, s, "GET", "/v1/messages/mytopic/seq-1", "", nil)
++		require.Equal(t, 200, response.Code)
++		var state messageAPIResponse
++		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &state))
++		require.Equal(t, message.RegistryStateRetracted, state.State)
++
++		// A replayed DELETE is answered without a second event piling up in the cache.
++		before := len(messageAPIMessages(t, s, "mytopic"))
++		response = request(t, s, "DELETE", "/v1/messages/mytopic/seq-1", "", nil)
++		require.Equal(t, 200, response.Code)
++		require.Len(t, messageAPIMessages(t, s, "mytopic"), before)
++	})
++}
++
++// messageAPIMessages reads the topic listing the message API exposes, for assertions about what a
++// subscriber would replay.
++func messageAPIMessages(t *testing.T, s *Server, topic string) []*model.Message {
++	t.Helper()
++	response := request(t, s, "GET", "/v1/messages/"+topic, "", nil)
++	require.Equal(t, 200, response.Code)
++	var list struct {
++		Topic    string           `json:"topic"`
++		Messages []*model.Message `json:"messages"`
++	}
++	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &list))
++	require.Equal(t, topic, list.Topic)
++	return list.Messages
++}
+diff --git a/server/server.go b/server/server.go
+index 27f13e6c..ff9bb768 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -110,6 +110,7 @@ var (
+ 	clearPathRegex         = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/(read|clear)$`)
+ 	deletePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/delete$`)
+ 	messageAPIPathRegex    = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})/([-_A-Za-z0-9]{1,64})(/ack)?$`)
++	messageAPITopicRegex   = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})$`)
+ 	sequenceIDRegex        = topicRegex
+ 
+ 	webAppConfigPath              = "/config.js"
+@@ -887,7 +888,7 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, v *visit
+ 		return s.ensureWebPushEnabled(s.limitRequests(s.handleWebPushDelete))(w, r, v)
+ 	} else if r.Method == http.MethodGet && r.URL.Path == apiStatsPath {
+ 		return s.handleStats(w, r, v)
+-	} else if messageAPIPathRegex.MatchString(r.URL.Path) {
++	} else if messageAPIPathRegex.MatchString(r.URL.Path) || messageAPITopicRegex.MatchString(r.URL.Path) {
+ 		return s.limitRequests(s.handleMessageAPI)(w, r, v)
+ 	} else if r.Method == http.MethodGet && r.URL.Path == apiAccountBillingTiersPath {
+ 		return s.ensurePaymentsEnabled(s.handleBillingTiersGet)(w, r, v)
+-- 
+2.53.0
+

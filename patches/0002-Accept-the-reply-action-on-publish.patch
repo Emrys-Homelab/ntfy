@@ -1,0 +1,147 @@
+From 38d30ce77fe66e15317c109181d6c6770375eb83 Mon Sep 17 00:00:00 2001
+From: Emrys Homelab <homelab@emrys.dev>
+Date: Mon, 23 Nov 2026 14:00:27 -0600
+Subject: [PATCH 2/2] Accept the reply action on publish
+
+---
+ action/action.go      | 16 ++++++++++++----
+ action/action_test.go | 41 +++++++++++++++++++++++++++++++++++++++--
+ model/model.go        |  6 +++---
+ 3 files changed, 54 insertions(+), 9 deletions(-)
+
+diff --git a/action/action.go b/action/action.go
+index 6aa2a1ee..e04c41b2 100644
+--- a/action/action.go
++++ b/action/action.go
+@@ -25,12 +25,13 @@ const (
+ 	actionBroadcast = "broadcast"
+ 	actionHTTP      = "http"
+ 	actionCopy      = "copy"
++	actionReply     = "reply"
+ )
+ 
+ var (
+-	actionsAll       = []string{actionView, actionBroadcast, actionHTTP, actionCopy}
+-	actionsWithURL   = []string{actionView, actionHTTP} // Must be distinct from actionsWithValue, see populateAction()
+-	actionsWithValue = []string{actionCopy}             // Must be distinct from actionsWithURL, see populateAction()
++	actionsAll       = []string{actionView, actionBroadcast, actionHTTP, actionCopy, actionReply}
++	actionsWithURL   = []string{actionView, actionHTTP, actionReply} // Must be distinct from actionsWithValue, see populateAction()
++	actionsWithValue = []string{actionCopy}                          // Must be distinct from actionsWithURL, see populateAction()
+ 	actionsKeyRegex  = regexp.MustCompile(`^([-.\w]+)\s*=\s*`)
+ )
+ 
+@@ -59,6 +60,9 @@ func Parse(s string) (actions []*model.Action, err error) {
+ 		actions[i].ID = util.RandomString(actionIDLength)
+ 		actions[i].Action = strings.ToLower(actions[i].Action)
+ 		actions[i].Method = strings.ToUpper(actions[i].Method)
++		if actions[i].Action == actionReply && actions[i].Method == "" {
++			actions[i].Method = "POST"
++		}
+ 	}
+ 
+ 	// Validate
+@@ -67,7 +71,7 @@ func Parse(s string) (actions []*model.Action, err error) {
+ 	}
+ 	for _, action := range actions {
+ 		if !util.Contains(actionsAll, action.Action) {
+-			return nil, fmt.Errorf("parameter 'action' cannot be '%s', valid values are 'view', 'broadcast', 'http' and 'copy'", action.Action)
++			return nil, fmt.Errorf("parameter 'action' cannot be '%s', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'", action.Action)
+ 		} else if action.Label == "" {
+ 			return nil, fmt.Errorf("parameter 'label' is required")
+ 		} else if util.Contains(actionsWithURL, action.Action) && action.URL == "" {
+@@ -76,6 +80,10 @@ func Parse(s string) (actions []*model.Action, err error) {
+ 			return nil, fmt.Errorf("parameter 'value' is required for action '%s'", action.Action)
+ 		} else if action.Action == actionHTTP && util.Contains([]string{"GET", "HEAD"}, action.Method) && action.Body != "" {
+ 			return nil, fmt.Errorf("parameter 'body' cannot be set if method is %s", action.Method)
++		} else if action.Action == actionReply && action.Method != "POST" {
++			return nil, fmt.Errorf("parameter 'method' must be POST for action 'reply'")
++		} else if action.Action == actionReply && action.Body != "" {
++			return nil, fmt.Errorf("parameter 'body' cannot be set for action 'reply'")
+ 		}
+ 	}
+ 
+diff --git a/action/action_test.go b/action/action_test.go
+index 68b4527d..325cd12a 100644
+--- a/action/action_test.go
++++ b/action/action_test.go
+@@ -171,6 +171,43 @@ func TestParseActions(t *testing.T) {
+ 	_, err = Parse("copy, Copy code")
+ 	require.EqualError(t, err, "parameter 'value' is required for action 'copy'")
+ 
++	// Reply action (JSON) - url, method and headers are the existing fields
++	actions, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","method":"POST","headers":{"X-Topic":"homelab-inbox"}}]`)
++	require.Nil(t, err)
++	require.Equal(t, 1, len(actions))
++	require.Equal(t, "reply", actions[0].Action)
++	require.Equal(t, "Reply", actions[0].Label)
++	require.Equal(t, "https://notify.emrys.dev/v1/reply", actions[0].URL)
++	require.Equal(t, "POST", actions[0].Method)
++	require.Equal(t, "homelab-inbox", actions[0].Headers["X-Topic"])
++	require.False(t, actions[0].Clear)
++
++	// Reply action defaults the method to POST
++	actions, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply"}]`)
++	require.Nil(t, err)
++	require.Equal(t, "POST", actions[0].Method)
++
++	// Reply action (simple format), with clear
++	actions, err = Parse("action=reply, label=Reply, url=https://notify.emrys.dev/v1/reply, clear=true, headers.X-Topic=homelab-inbox")
++	require.Nil(t, err)
++	require.Equal(t, 1, len(actions))
++	require.Equal(t, "reply", actions[0].Action)
++	require.Equal(t, "POST", actions[0].Method)
++	require.Equal(t, "homelab-inbox", actions[0].Headers["X-Topic"])
++	require.True(t, actions[0].Clear)
++
++	// Reply action without url (error)
++	_, err = Parse(`[{"action":"reply","label":"Reply"}]`)
++	require.EqualError(t, err, "parameter 'url' is required for action 'reply'")
++
++	// Reply action that is not a POST (error)
++	_, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","method":"GET"}]`)
++	require.EqualError(t, err, "parameter 'method' must be POST for action 'reply'")
++
++	// Reply action with a body (error)
++	_, err = Parse(`[{"action":"reply","label":"Reply","url":"https://notify.emrys.dev/v1/reply","body":"x"}]`)
++	require.EqualError(t, err, "parameter 'body' cannot be set for action 'reply'")
++
+ 	// Invalid syntax
+ 	_, err = Parse(`label="Out of order!" x, action="http", url=http://example.com`)
+ 	require.EqualError(t, err, "unexpected character 'x' at position 22")
+@@ -185,7 +222,7 @@ func TestParseActions(t *testing.T) {
+ 	require.EqualError(t, err, "term 'what is this anyway' unknown")
+ 
+ 	_, err = Parse(`fdsfdsf`)
+-	require.EqualError(t, err, "parameter 'action' cannot be 'fdsfdsf', valid values are 'view', 'broadcast', 'http' and 'copy'")
++	require.EqualError(t, err, "parameter 'action' cannot be 'fdsfdsf', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'")
+ 
+ 	_, err = Parse(`aaa=a, "bbb, 'ccc, ddd, eee "`)
+ 	require.EqualError(t, err, "key 'aaa' unknown")
+@@ -212,7 +249,7 @@ func TestParseActions(t *testing.T) {
+ 	require.EqualError(t, err, "JSON error: invalid character 'i' looking for beginning of value")
+ 
+ 	_, err = Parse(`[ { "some": "object" } ]`)
+-	require.EqualError(t, err, "parameter 'action' cannot be '', valid values are 'view', 'broadcast', 'http' and 'copy'")
++	require.EqualError(t, err, "parameter 'action' cannot be '', valid values are 'view', 'broadcast', 'http', 'copy' and 'reply'")
+ 
+ 	_, err = Parse("\x00\x01\xFFx\xFE")
+ 	require.EqualError(t, err, "invalid utf-8 string")
+diff --git a/model/model.go b/model/model.go
+index a644ff3e..31657332 100644
+--- a/model/model.go
++++ b/model/model.go
+@@ -131,11 +131,11 @@ type Attachment struct {
+ // Action represents a user-defined action on a message
+ type Action struct {
+ 	ID      string            `json:"id"`
+-	Action  string            `json:"action"`            // "view", "broadcast", "http", or "copy"
++	Action  string            `json:"action"`            // "view", "broadcast", "http", "copy", or "reply"
+ 	Label   string            `json:"label"`             // action button label
+ 	Clear   bool              `json:"clear"`             // clear notification after successful execution
+-	URL     string            `json:"url,omitempty"`     // used in "view" and "http" actions
+-	Method  string            `json:"method,omitempty"`  // used in "http" action, default is POST (!)
++	URL     string            `json:"url,omitempty"`     // used in "view", "http" and "reply" actions
++	Method  string            `json:"method,omitempty"`  // used in "http" and "reply" actions, default is POST (!)
+ 	Headers map[string]string `json:"headers,omitempty"` // used in "http" action
+ 	Body    string            `json:"body,omitempty"`    // used in "http" action
+ 	Intent  string            `json:"intent,omitempty"`  // used in "broadcast" action

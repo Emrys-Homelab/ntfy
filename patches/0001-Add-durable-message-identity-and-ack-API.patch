@@ -1,0 +1,868 @@
+From e350989100c86d1402d63db3a4163cb843304d06 Mon Sep 17 00:00:00 2001
+From: Emrys Homelab <homelab@emrys.dev>
+Date: Sun, 22 Nov 2026 15:50:02 -0600
+Subject: [PATCH] Add durable message identity and ack API
+
+---
+ cmd/serve.go             |  12 ++
+ message/registry.go      | 276 +++++++++++++++++++++++++++++++++++++
+ message/registry_test.go |  67 +++++++++
+ server/config.go         |   5 +
+ server/errors.go         |   3 +
+ server/message_api.go    | 289 +++++++++++++++++++++++++++++++++++++++
+ server/server.go         |  27 ++++
+ 7 files changed, 679 insertions(+)
+ create mode 100644 message/registry.go
+ create mode 100644 message/registry_test.go
+ create mode 100644 server/message_api.go
+
+diff --git a/cmd/serve.go b/cmd/serve.go
+index b2c0338e..2c1e5b4d 100644
+--- a/cmd/serve.go
++++ b/cmd/serve.go
+@@ -57,6 +57,8 @@ var flagsServe = append(
+ 	altsrc.NewStringFlag(&cli.StringFlag{Name: "cache-duration", Aliases: []string{"cache_duration", "b"}, EnvVars: []string{"NTFY_CACHE_DURATION"}, Value: util.FormatDuration(server.DefaultCacheDuration), Usage: "buffer messages for this time to allow `since` requests"}),
+ 	altsrc.NewIntFlag(&cli.IntFlag{Name: "cache-batch-size", Aliases: []string{"cache_batch_size"}, EnvVars: []string{"NTFY_BATCH_SIZE"}, Usage: "max size of messages to batch together when writing to message cache (if zero, writes are synchronous)"}),
+ 	altsrc.NewStringFlag(&cli.StringFlag{Name: "cache-batch-timeout", Aliases: []string{"cache_batch_timeout"}, EnvVars: []string{"NTFY_CACHE_BATCH_TIMEOUT"}, Value: util.FormatDuration(server.DefaultCacheBatchTimeout), Usage: "timeout for batched async writes to the message cache (if zero, writes are synchronous)"}),
++	altsrc.NewStringFlag(&cli.StringFlag{Name: "message-registry-file", Aliases: []string{"message_registry_file"}, EnvVars: []string{"NTFY_MESSAGE_REGISTRY_FILE"}, Usage: "SQLite file for durable message identity, read/ack state and update/retract; empty disables the extended message API"}),
++	altsrc.NewStringFlag(&cli.StringFlag{Name: "message-registry-duration", Aliases: []string{"message_registry_duration"}, EnvVars: []string{"NTFY_MESSAGE_REGISTRY_DURATION"}, Value: util.FormatDuration(server.DefaultMessageRegistryDuration), Usage: "how long a message identity stays addressable after its last change"}),
+ 	altsrc.NewStringFlag(&cli.StringFlag{Name: "cache-startup-queries", Aliases: []string{"cache_startup_queries"}, EnvVars: []string{"NTFY_CACHE_STARTUP_QUERIES"}, Usage: "queries run when the cache database is initialized"}),
+ 	altsrc.NewStringFlag(&cli.StringFlag{Name: "auth-file", Aliases: []string{"auth_file", "H"}, EnvVars: []string{"NTFY_AUTH_FILE"}, Usage: "auth database file used for access control"}),
+ 	altsrc.NewStringFlag(&cli.StringFlag{Name: "auth-startup-queries", Aliases: []string{"auth_startup_queries"}, EnvVars: []string{"NTFY_AUTH_STARTUP_QUERIES"}, Usage: "queries run when the auth database is initialized"}),
+@@ -188,6 +190,8 @@ func execServe(c *cli.Context) error {
+ 	cacheStartupQueries := c.String("cache-startup-queries")
+ 	cacheBatchSize := c.Int("cache-batch-size")
+ 	cacheBatchTimeoutStr := c.String("cache-batch-timeout")
++	messageRegistryFile := c.String("message-registry-file")
++	messageRegistryDurationStr := c.String("message-registry-duration")
+ 	authFile := c.String("auth-file")
+ 	authStartupQueries := c.String("auth-startup-queries")
+ 	authDefaultAccess := c.String("auth-default-access")
+@@ -263,6 +267,10 @@ func execServe(c *cli.Context) error {
+ 	if err != nil {
+ 		return fmt.Errorf("invalid cache batch timeout: %s", cacheBatchTimeoutStr)
+ 	}
++	messageRegistryDuration, err := util.ParseDuration(messageRegistryDurationStr)
++	if err != nil || messageRegistryDuration <= 0 {
++		return fmt.Errorf("invalid message registry duration: %s", messageRegistryDurationStr)
++	}
+ 	attachmentExpiryDuration, err := util.ParseDuration(attachmentExpiryDurationStr)
+ 	if err != nil {
+ 		return fmt.Errorf("invalid attachment expiry duration: %s", attachmentExpiryDurationStr)
+@@ -365,6 +373,8 @@ func execServe(c *cli.Context) error {
+ 		return errors.New("if database-url is set, it must start with postgres:// or postgresql://")
+ 	} else if databaseURL != "" && (authFile != "" || cacheFile != "" || webPushFile != "") {
+ 		return errors.New("if database-url is set, auth-file, cache-file, and web-push-file must not be set")
++	} else if databaseURL != "" && messageRegistryFile != "" {
++		return errors.New("if database-url is set, message-registry-file must not be set (the registry is SQLite-only)")
+ 	} else if len(databaseReplicaURLs) > 0 && databaseURL == "" {
+ 		return errors.New("database-replica-urls can only be used if database-url is also set")
+ 	} else if clusterListen != "" && databaseURL == "" {
+@@ -547,6 +557,8 @@ func execServe(c *cli.Context) error {
+ 	conf.CacheStartupQueries = cacheStartupQueries
+ 	conf.CacheBatchSize = cacheBatchSize
+ 	conf.CacheBatchTimeout = cacheBatchTimeout
++	conf.MessageRegistryFile = messageRegistryFile
++	conf.MessageRegistryDuration = messageRegistryDuration
+ 	conf.AuthFile = authFile
+ 	conf.AuthStartupQueries = authStartupQueries
+ 	conf.AuthDefault = authDefault
+diff --git a/message/registry.go b/message/registry.go
+new file mode 100644
+index 00000000..28cfca0c
+--- /dev/null
++++ b/message/registry.go
+@@ -0,0 +1,276 @@
++package message
++
++import (
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"path/filepath"
++	"sync"
++	"time"
++
++	_ "github.com/mattn/go-sqlite3"
++	"heckel.io/ntfy/v2/log"
++	"heckel.io/ntfy/v2/model"
++	"heckel.io/ntfy/v2/util"
++)
++
++// The registry is the durable half of a message identity. The message cache stores bytes for
++// replay and forgets them after cache-duration; the registry keeps the identity, the last
++// payload, and the read/ack state for message-registry-duration, in its own SQLite file. It is
++// deliberately separate from cache.db: a registry write must never touch the stock cache schema,
++// and a cache reset must not erase whether a message was read.
++
++const (
++	tagMessageRegistry = "message_registry"
++
++	// RegistryStateActive is a message that can still be updated or retracted.
++	RegistryStateActive = "active"
++
++	// RegistryStateRetracted is a message that has been withdrawn.
++	RegistryStateRetracted = "retracted"
++
++	// registryPruneInterval is how often expired identities are removed. The retention itself is
++	// measured in days, so the interval only bounds how long an expired row stays queryable.
++	registryPruneInterval = 10 * time.Minute
++)
++
++var (
++	// ErrMessageNotFound is returned when the identity is unknown, or its retention has elapsed.
++	ErrMessageNotFound = errors.New("message not found")
++
++	// ErrMessageRetracted is returned when an operation is not valid on a retracted message.
++	ErrMessageRetracted = errors.New("message retracted")
++)
++
++// MessageState is one durable message identity: the sequence ID scoped to its topic, the last
++// delivered message ID, its revision, and the read/ack and retraction state.
++type MessageState struct {
++	Topic       string          `json:"topic"`
++	Identity    string          `json:"identity"`   // The sequence ID, scoped to the topic
++	MessageID   string          `json:"message_id"` // Last delivered message ID (a new one per revision)
++	Revision    int64           `json:"revision"`   // 1 on first publish, incremented per update
++	State       string          `json:"state"`      // active or retracted
++	Read        bool            `json:"read"`       // A client reported it read/acknowledged
++	ReadAt      int64           `json:"read_at,omitempty"`
++	AckedAt     int64           `json:"acked_at,omitempty"`
++	RetractedAt int64           `json:"retracted_at,omitempty"`
++	RetractRead bool            `json:"retract_read,omitempty"` // Retracted after it was read: log-only, no delete event
++	CreatedAt   int64           `json:"created_at"`
++	UpdatedAt   int64           `json:"updated_at"`
++	ExpiresAt   int64           `json:"expires_at"`
++	Payload     json.RawMessage `json:"payload,omitempty"` // Last delivered message, for updates and the app log
++}
++
++// Registry stores durable message identities in SQLite.
++type Registry struct {
++	db        *sql.DB
++	retention time.Duration
++	mu        sync.Mutex
++	stop      chan struct{}
++	stopped   chan struct{}
++	closeOnce sync.Once
++}
++
++const registrySchema = `
++CREATE TABLE IF NOT EXISTS message_registry (
++	topic         TEXT    NOT NULL,
++	identity      TEXT    NOT NULL,
++	message_id    TEXT    NOT NULL,
++	revision      INTEGER NOT NULL DEFAULT 1,
++	state         TEXT    NOT NULL DEFAULT 'active',
++	read_at       INTEGER NOT NULL DEFAULT 0,
++	acked_at      INTEGER NOT NULL DEFAULT 0,
++	retracted_at  INTEGER NOT NULL DEFAULT 0,
++	retract_read  INTEGER NOT NULL DEFAULT 0,
++	created_at    INTEGER NOT NULL,
++	updated_at    INTEGER NOT NULL,
++	expires_at    INTEGER NOT NULL,
++	payload       TEXT    NOT NULL,
++	PRIMARY KEY (topic, identity)
++);
++CREATE INDEX IF NOT EXISTS idx_message_registry_expires ON message_registry (expires_at);
++`
++
++// NewRegistry opens (and creates, if needed) the registry file. The retention is how long an
++// identity remains addressable after its last publish/update/ack/retract; it is independent of
++// the cache's cache-duration ceiling.
++func NewRegistry(filename string, retention time.Duration) (*Registry, error) {
++	parentDir := filepath.Dir(filename)
++	if !util.FileExists(parentDir) {
++		return nil, fmt.Errorf("message registry directory %s does not exist or is not accessible", parentDir)
++	}
++	if retention <= 0 {
++		return nil, errors.New("message registry duration must be positive")
++	}
++	dsn := filename + "?_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL"
++	d, err := sql.Open("sqlite3", dsn)
++	if err != nil {
++		return nil, err
++	}
++	// The registry is small and single-writer by nature. One connection keeps SQLite from
++	// returning SQLITE_BUSY under concurrent update/ack/retract requests.
++	d.SetMaxOpenConns(1)
++	if _, err := d.Exec(registrySchema); err != nil {
++		d.Close()
++		return nil, fmt.Errorf("cannot create message registry schema: %w", err)
++	}
++	r := &Registry{
++		db:        d,
++		retention: retention,
++		stop:      make(chan struct{}),
++		stopped:   make(chan struct{}),
++	}
++	r.prune()
++	go r.pruneLoop()
++	return r, nil
++}
++
++func (r *Registry) pruneLoop() {
++	defer close(r.stopped)
++	ticker := time.NewTicker(registryPruneInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			r.prune()
++		case <-r.stop:
++			return
++		}
++	}
++}
++
++func (r *Registry) prune() {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	res, err := r.db.Exec(`DELETE FROM message_registry WHERE expires_at < ?`, time.Now().Unix())
++	if err != nil {
++		log.Tag(tagMessageRegistry).Err(err).Warn("Unable to prune expired message identities")
++		return
++	}
++	if n, err := res.RowsAffected(); err == nil && n > 0 {
++		log.Tag(tagMessageRegistry).Debug("Pruned %d expired message identities", n)
++	}
++}
++
++// Put records a delivered message under its topic and sequence ID. A repeat publish with the same
++// identity increments the revision and replaces the stored payload; read state is preserved,
++// because an update must not silently mark a read message unread. A retracted identity is not
++// resurrected by a stock publish.
++func (r *Registry) Put(m *model.Message) (*MessageState, error) {
++	if m.SequenceID == "" {
++		return nil, errors.New("message has no sequence ID")
++	}
++	payload, err := json.Marshal(m)
++	if err != nil {
++		return nil, err
++	}
++	now := time.Now().Unix()
++	expires := now + int64(r.retention/time.Second)
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if _, err := r.db.Exec(`
++		INSERT INTO message_registry
++			(topic, identity, message_id, revision, state, created_at, updated_at, expires_at, payload)
++		VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
++		ON CONFLICT (topic, identity) DO UPDATE SET
++			message_id = excluded.message_id,
++			revision   = message_registry.revision + 1,
++			updated_at = excluded.updated_at,
++			expires_at = excluded.expires_at,
++			payload    = excluded.payload
++		WHERE message_registry.state = ?`,
++		m.Topic, m.SequenceID, m.ID, RegistryStateActive, now, now, expires, string(payload), RegistryStateActive); err != nil {
++		return nil, err
++	}
++	return r.getLocked(m.Topic, m.SequenceID)
++}
++
++// Get returns the current state of an identity.
++func (r *Registry) Get(topic, identity string) (*MessageState, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.getLocked(topic, identity)
++}
++
++func (r *Registry) getLocked(topic, identity string) (*MessageState, error) {
++	var (
++		st          MessageState
++		retractRead int
++		payload     string
++	)
++	err := r.db.QueryRow(`
++		SELECT topic, identity, message_id, revision, state, read_at, acked_at, retracted_at,
++		       retract_read, created_at, updated_at, expires_at, payload
++		FROM message_registry WHERE topic = ? AND identity = ?`, topic, identity).Scan(
++		&st.Topic, &st.Identity, &st.MessageID, &st.Revision, &st.State, &st.ReadAt, &st.AckedAt,
++		&st.RetractedAt, &retractRead, &st.CreatedAt, &st.UpdatedAt, &st.ExpiresAt, &payload)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrMessageNotFound
++	} else if err != nil {
++		return nil, err
++	}
++	st.Read = st.ReadAt > 0
++	st.RetractRead = retractRead != 0
++	st.Payload = json.RawMessage(payload)
++	return &st, nil
++}
++
++// Ack records that a client read/acknowledged the message. It is idempotent and does not change
++// the revision or the state; only the read/ack timestamps move.
++func (r *Registry) Ack(topic, identity string) (*MessageState, error) {
++	now := time.Now().Unix()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	st, err := r.getLocked(topic, identity)
++	if err != nil {
++		return nil, err
++	} else if st.State == RegistryStateRetracted {
++		return nil, ErrMessageRetracted
++	} else if st.Read {
++		return st, nil
++	}
++	expires := now + int64(r.retention/time.Second)
++	if _, err := r.db.Exec(`
++		UPDATE message_registry SET read_at = ?, acked_at = ?, updated_at = ?, expires_at = ?
++		WHERE topic = ? AND identity = ?`, now, now, now, expires, topic, identity); err != nil {
++		return nil, err
++	}
++	return r.getLocked(topic, identity)
++}
++
++// MarkRetracted withdraws an identity. retractRead says whether it had already been read; that is
++// what tells the caller whether a delete event belongs on the wire.
++func (r *Registry) MarkRetracted(topic, identity string, retractRead bool) (*MessageState, error) {
++	now := time.Now().Unix()
++	readFlag := 0
++	if retractRead {
++		readFlag = 1
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	st, err := r.getLocked(topic, identity)
++	if err != nil {
++		return nil, err
++	} else if st.State == RegistryStateRetracted {
++		return st, nil
++	}
++	expires := now + int64(r.retention/time.Second)
++	if _, err := r.db.Exec(`
++		UPDATE message_registry SET state = ?, retracted_at = ?, retract_read = ?, updated_at = ?, expires_at = ?
++		WHERE topic = ? AND identity = ?`, RegistryStateRetracted, now, readFlag, now, expires, topic, identity); err != nil {
++		return nil, err
++	}
++	return r.getLocked(topic, identity)
++}
++
++// Close stops the pruner and closes the database.
++func (r *Registry) Close() error {
++	var err error
++	r.closeOnce.Do(func() {
++		close(r.stop)
++		<-r.stopped
++		err = r.db.Close()
++	})
++	return err
++}
+diff --git a/message/registry_test.go b/message/registry_test.go
+new file mode 100644
+index 00000000..ca577e78
+--- /dev/null
++++ b/message/registry_test.go
+@@ -0,0 +1,67 @@
++package message
++
++import (
++	"errors"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"heckel.io/ntfy/v2/model"
++)
++
++func TestRegistryLifecycle(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "registry.db")
++	r, err := NewRegistry(filename, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	m := model.NewDefaultMessage("mytopic", "first")
++	m.SequenceID = "identity-1"
++	st, err := r.Put(m)
++	if err != nil {
++		t.Fatal(err)
++	} else if st.Revision != 1 || st.State != RegistryStateActive || st.Read {
++		t.Fatalf("unexpected initial state: %+v", st)
++	}
++	st, err = r.Ack("mytopic", "identity-1")
++	if err != nil {
++		t.Fatal(err)
++	} else if !st.Read || st.ReadAt == 0 {
++		t.Fatalf("ack did not mark read: %+v", st)
++	}
++	m2 := model.NewDefaultMessage("mytopic", "second")
++	m2.SequenceID = "identity-1"
++	st, err = r.Put(m2)
++	if err != nil {
++		t.Fatal(err)
++	} else if st.Revision != 2 || !st.Read || st.MessageID != m2.ID {
++		t.Fatalf("update did not preserve read state: %+v", st)
++	}
++	if _, err := r.Get("mytopic", "nope"); !errors.Is(err, ErrMessageNotFound) {
++		t.Fatalf("expected ErrMessageNotFound, got %v", err)
++	}
++	st, err = r.MarkRetracted("mytopic", "identity-1", true)
++	if err != nil {
++		t.Fatal(err)
++	} else if st.State != RegistryStateRetracted || !st.RetractRead {
++		t.Fatalf("unexpected retracted state: %+v", st)
++	}
++	if _, err := r.Ack("mytopic", "identity-1"); !errors.Is(err, ErrMessageRetracted) {
++		t.Fatalf("expected ErrMessageRetracted, got %v", err)
++	}
++	if err := r.Close(); err != nil {
++		t.Fatal(err)
++	}
++	// The identity survives a restart because it is in its own SQLite file.
++	r, err = NewRegistry(filename, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer r.Close()
++	st, err = r.Get("mytopic", "identity-1")
++	if err != nil {
++		t.Fatal(err)
++	} else if st.State != RegistryStateRetracted || st.Revision != 2 {
++		t.Fatalf("state did not survive reopen: %+v", st)
++	}
++}
+diff --git a/server/config.go b/server/config.go
+index b0656038..57358463 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -22,6 +22,7 @@ const (
+ 	DefaultListenAdminUnixMode                  = fs.FileMode(0660) // Owner (the ntfy user) and the ntfy group; root bypasses anyway
+ 	DefaultListenHTTP                           = ":80"
+ 	DefaultCacheDuration                        = 12 * time.Hour
++	DefaultMessageRegistryDuration              = 30 * 24 * time.Hour // A message identity outlives the cache's 12h default by a wide margin
+ 	DefaultCacheBatchTimeout                    = time.Duration(0)
+ 	DefaultKeepaliveInterval                    = 45 * time.Second // Not too frequently to save battery (Android read timeout used to be 77s!)
+ 	DefaultManagerInterval                      = time.Minute
+@@ -153,6 +154,8 @@ type Config struct {
+ 	CacheStartupQueries                  string
+ 	CacheBatchSize                       int
+ 	CacheBatchTimeout                    time.Duration
++	MessageRegistryFile                  string        // SQLite file for durable message identity, read/ack state and update/retract; empty disables the API
++	MessageRegistryDuration              time.Duration // How long an identity stays addressable, independent of CacheDuration
+ 	AuthFile                             string
+ 	AuthStartupQueries                   string
+ 	AuthDefault                          user.Permission
+@@ -293,6 +296,8 @@ func NewConfig() *Config {
+ 		CacheStartupQueries:                  "",
+ 		CacheBatchSize:                       0,
+ 		CacheBatchTimeout:                    0,
++		MessageRegistryFile:                  "",
++		MessageRegistryDuration:              DefaultMessageRegistryDuration,
+ 		AuthFile:                             "",
+ 		AuthStartupQueries:                   "",
+ 		AuthDefault:                          user.PermissionReadWrite,
+diff --git a/server/errors.go b/server/errors.go
+index f138f5fa..799ae01b 100644
+--- a/server/errors.go
++++ b/server/errors.go
+@@ -184,7 +184,9 @@ var (
+ 	errHTTPBadRequestUserNoPrimaryEmail              = &errHTTP{40067, http.StatusBadRequest, "invalid request: user has no primary email, cannot send reset link", "", nil, nil}
+ 	errHTTPBadRequestBaseURLNotConfigured            = &errHTTP{40068, http.StatusBadRequest, "invalid request: base-url must be configured on the server to generate links", "https://ntfy.sh/docs/config/", nil, nil}
+ 	errHTTPBadRequestPasswordHashInvalid             = &errHTTP{40069, http.StatusBadRequest, "invalid request: password hash must be a bcrypt hash with cost 10 or higher, use 'ntfy user hash' to generate", "", nil, nil}
++	errHTTPBadRequestMessageTooLarge                 = &errHTTP{40070, http.StatusBadRequest, "invalid request: message is too large", "https://ntfy.sh/docs/publish/#limitations", nil, nil}
+ 	errHTTPNotFound                                  = &errHTTP{40401, http.StatusNotFound, "page not found", "", nil, nil}
++	errHTTPMessageNotFound                           = &errHTTP{40402, http.StatusNotFound, "message not found", "", nil, nil}
+ 	errHTTPUnauthorized                              = &errHTTP{40101, http.StatusUnauthorized, "unauthorized", "https://ntfy.sh/docs/publish/#authentication", nil, nil}
+ 	errHTTPForbidden                                 = &errHTTP{40301, http.StatusForbidden, "forbidden", "https://ntfy.sh/docs/publish/#authentication", nil, nil}
+ 	errHTTPForbiddenAdminSocketOnly                  = &errHTTP{40302, http.StatusForbidden, "forbidden: this operation is only allowed over the local admin socket", "https://ntfy.sh/docs/config/#admin-socket", nil, nil}
+@@ -198,6 +200,7 @@ var (
+ 	errHTTPConflictEmailPrimaryElsewhere             = &errHTTP{40908, http.StatusConflict, "conflict: email address is the primary email on another account", "", nil, nil}
+ 	errHTTPConflictTierExists                        = &errHTTP{40909, http.StatusConflict, "conflict: tier already exists", "", nil, nil}
+ 	errHTTPConflictTierInUse                         = &errHTTP{40910, http.StatusConflict, "conflict: tier is still assigned to users", "", nil, nil}
++	errHTTPConflictMessageRetracted                  = &errHTTP{40911, http.StatusConflict, "conflict: message has been retracted", "", nil, nil}
+ 	errHTTPGonePhoneVerificationExpired              = &errHTTP{41001, http.StatusGone, "phone number verification expired or does not exist", "", nil, nil}
+ 	errHTTPGoneUnifiedPushTopicAbandoned             = &errHTTP{41002, http.StatusGone, "UnifiedPush topic has had no subscriber for too long, subscription expired", "", nil, nil}
+ 	errHTTPEntityTooLargeAttachment                  = &errHTTP{41301, http.StatusRequestEntityTooLarge, "attachment too large, or bandwidth limit reached", "https://ntfy.sh/docs/publish/#limitations", nil, nil}
+diff --git a/server/message_api.go b/server/message_api.go
+new file mode 100644
+index 00000000..a4a6347f
+--- /dev/null
++++ b/server/message_api.go
+@@ -0,0 +1,289 @@
++package server
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++	"time"
++
++	"heckel.io/ntfy/v2/message"
++	"heckel.io/ntfy/v2/model"
++	"heckel.io/ntfy/v2/user"
++)
++
++// The extended message API. It is additive: the stock publish/subscribe paths are untouched, and
++// the delivery primitives it emits (message_clear, message_delete, and a publish with the same
++// sequence ID) are the ones stock ntfy clients already understand. What the fork adds is durable
++// server-side identity and state, so update/retract/ack survive the cache TTL and a restart, and
++// so an update can be *decided* by the server instead of guessed by a client.
++//
++//	GET    /v1/messages/<topic>/<identity>        read the durable state (read permission)
++//	PATCH  /v1/messages/<topic>/<identity>        update; replace if unread, re-alert if read (write)
++//	PUT    /v1/messages/<topic>/<identity>        same as PATCH (write)
++//	DELETE /v1/messages/<topic>/<identity>        retract; remove if unread, log-only if read (write)
++//	POST   /v1/messages/<topic>/<identity>/ack    mark read/acknowledged (read permission)
++//
++// <identity> is the message's sequence ID, which is the identity stock ntfy already puts on the
++// wire. The message `id` is not an identity: it changes with every revision.
++
++const (
++	messageAPIPathPrefix = "/v1/messages/"
++)
++
++// messageAPIResponse is a registry state with the operation's outcome attached.
++type messageAPIResponse struct {
++	*message.MessageState
++	Disposition string `json:"disposition,omitempty"`
++}
++
++// messageUpdateRequest carries the fields an update may change. Pointers distinguish "not
++// provided" from "set to the zero value", so a PATCH can change only the body.
++type messageUpdateRequest struct {
++	Message     *string          `json:"message"`
++	Title       *string          `json:"title"`
++	Priority    *int             `json:"priority"`
++	Tags        *[]string        `json:"tags"`
++	Click       *string          `json:"click"`
++	Icon        *string          `json:"icon"`
++	Actions     *[]*model.Action `json:"actions"`
++	ContentType *string          `json:"content_type"`
++}
++
++// handleMessageAPI dispatches the extended message endpoints. Authentication already happened in
++// handle(); authorization is by the row's topic, so a token with write access to one topic cannot
++// touch another topic's message.
++func (s *Server) handleMessageAPI(w http.ResponseWriter, r *http.Request, v *visitor) error {
++	if s.messageRegistry == nil {
++		return errHTTPNotFound // The feature is off unless message-registry-file is configured
++	}
++	topic, identity, ack := splitMessageAPIPath(r.URL.Path)
++	if topic == "" || identity == "" {
++		return errHTTPNotFound
++	}
++	switch {
++	case r.Method == http.MethodGet && !ack:
++		if err := s.authorizeMessageTopic(v, topic, user.PermissionRead); err != nil {
++			return err
++		}
++		return s.handleMessageGet(w, topic, identity)
++	case r.Method == http.MethodPost && ack:
++		if err := s.authorizeMessageTopic(v, topic, user.PermissionRead); err != nil {
++			return err
++		}
++		return s.handleMessageAck(w, r, v, topic, identity)
++	case (r.Method == http.MethodPatch || r.Method == http.MethodPut) && !ack:
++		if err := s.authorizeMessageTopic(v, topic, user.PermissionWrite); err != nil {
++			return err
++		}
++		return s.handleMessageUpdate(w, r, v, topic, identity)
++	case r.Method == http.MethodDelete && !ack:
++		if err := s.authorizeMessageTopic(v, topic, user.PermissionWrite); err != nil {
++			return err
++		}
++		return s.handleMessageRetract(w, r, v, topic, identity)
++	}
++	return errHTTPNotFound
++}
++
++// splitMessageAPIPath returns the topic, identity and whether the path ends in /ack.
++func splitMessageAPIPath(path string) (string, string, bool) {
++	if !messageAPIPathRegex.MatchString(path) {
++		return "", "", false
++	}
++	parts := messageAPIPathRegex.FindStringSubmatch(path)
++	ack := parts[3] == "/ack"
++	return parts[1], parts[2], ack
++}
++
++func (s *Server) authorizeMessageTopic(v *visitor, topic string, perm user.Permission) error {
++	if s.userManager == nil {
++		return nil // Authentication is not configured; this is the stock anonymous mode
++	}
++	if s.userManager != nil {
++		if err := s.userManager.Authorize(v.User(), topic, perm); err != nil {
++			logv(v).Err(err).Debug("Access to message topic %s not authorized", topic)
++			return errHTTPForbidden
++		}
++	}
++	return nil
++}
++
++func (s *Server) handleMessageGet(w http.ResponseWriter, topic, identity string) error {
++	st, err := s.messageRegistry.Get(topic, identity)
++	if errors.Is(err, message.ErrMessageNotFound) {
++		return errHTTPMessageNotFound
++	} else if err != nil {
++		return err
++	}
++	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "state"})
++}
++
++func (s *Server) handleMessageAck(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
++	st, err := s.messageRegistry.Get(topic, identity)
++	if errors.Is(err, message.ErrMessageNotFound) {
++		return errHTTPMessageNotFound
++	} else if err != nil {
++		return err
++	} else if st.State == message.RegistryStateRetracted {
++		return errHTTPConflictMessageRetracted
++	}
++	if st.Read {
++		return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "already_acked"})
++	}
++	st, err = s.messageRegistry.Ack(topic, identity)
++	if err != nil {
++		return err
++	}
++	// The clear event is what makes a later update re-alert rather than replace: stock clients
++	// drop the notification slot when they see message_clear, so the next same-sequence message is
++	// a new notification. It is also the stock "read" signal, so no new wire primitive is needed.
++	if err := s.publishActionMessage(v, topic, identity, model.MessageClearEvent); err != nil {
++		return err
++	}
++	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "acknowledged"})
++}
++
++func (s *Server) handleMessageUpdate(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
++	st, err := s.messageRegistry.Get(topic, identity)
++	if errors.Is(err, message.ErrMessageNotFound) {
++		return errHTTPMessageNotFound
++	} else if err != nil {
++		return err
++	} else if st.State == message.RegistryStateRetracted {
++		return errHTTPConflictMessageRetracted
++	}
++	var req messageUpdateRequest
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, jsonBodyBytesLimit)).Decode(&req); err != nil {
++		return errHTTPBadRequest
++	}
++	// Rebuild from the stored payload so a PATCH that omits a field keeps its previous value.
++	var m model.Message
++	if err := json.Unmarshal(st.Payload, &m); err != nil {
++		return err
++	}
++	if req.Message != nil {
++		m.Message = *req.Message
++		m.Encoding = "" // The update body is text, not the base64 the original may have used
++	}
++	if req.Title != nil {
++		m.Title = *req.Title
++	}
++	if req.Priority != nil {
++		if *req.Priority < 1 || *req.Priority > 5 {
++			return errHTTPBadRequestPriorityInvalid
++		}
++		m.Priority = *req.Priority
++	}
++	if req.Tags != nil {
++		m.Tags = *req.Tags
++	}
++	if req.Click != nil {
++		m.Click = *req.Click
++	}
++	if req.Icon != nil {
++		m.Icon = *req.Icon
++	}
++	if req.Actions != nil {
++		m.Actions = *req.Actions
++	}
++	if req.ContentType != nil {
++		m.ContentType = *req.ContentType
++	}
++	if len(m.Message) > s.config.MessageSizeLimit {
++		return errHTTPBadRequestMessageTooLarge
++	}
++	m.ID = model.GenerateMessageID()
++	m.SequenceID = identity
++	m.Topic = topic
++	m.Time = time.Now().Unix()
++	m.Event = model.MessageEvent
++	m.Expires = time.Unix(m.Time, 0).Add(v.Limits().MessageExpiryDuration).Unix()
++	if m.Message == "" {
++		m.Message = emptyMessageBody
++	}
++	m.SanitizeUTF8()
++
++	if d := v.MessageAllowed(); !d.OK {
++		return errHTTPTooManyRequestsLimitMessages.WithLimitDecision(d)
++	}
++	t, err := s.topicFromID(v, topic)
++	if err != nil {
++		return err
++	}
++	// Read: clear the existing notification slot first, then publish the update. The client sees
++	// clear -> new message, so it alerts again instead of silently replacing. Unread: the update
++	// alone replaces the still-displayed notification in place.
++	disposition := "replaced"
++	if st.Read {
++		disposition = "realerted"
++		if err := s.publishActionMessage(v, topic, identity, model.MessageClearEvent); err != nil {
++			return err
++		}
++	}
++	if err := s.dispatch(v, t, &m, dispatchOpts{firebase: true, webPush: true}); err != nil {
++		return err
++	}
++	if err := s.messageCache.AddMessage(&m); err != nil {
++		return err
++	}
++	s.mu.Lock()
++	s.messages++
++	s.mu.Unlock()
++	st, err = s.messageRegistry.Put(&m)
++	if err != nil {
++		return err
++	}
++	w.Header().Set("X-Ntfy-Sequence-ID", identity)
++	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
++}
++
++func (s *Server) handleMessageRetract(w http.ResponseWriter, r *http.Request, v *visitor, topic, identity string) error {
++	st, err := s.messageRegistry.Get(topic, identity)
++	if errors.Is(err, message.ErrMessageNotFound) {
++		return errHTTPMessageNotFound
++	} else if err != nil {
++		return err
++	} else if st.State == message.RegistryStateRetracted {
++		return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: "already_retracted"})
++	}
++	read := st.Read
++	if !read {
++		// Unread: the stock delete event removes it from the notification shade. Read: no event is
++		// published at all, so it stays a silent log line in the app instead of re-notifying.
++		if err := s.publishActionMessage(v, topic, identity, model.MessageDeleteEvent); err != nil {
++			return err
++		}
++	}
++	st, err = s.messageRegistry.MarkRetracted(topic, identity, read)
++	if err != nil {
++		return err
++	}
++	disposition := "removed"
++	if read {
++		disposition = "log_only"
++	}
++	return s.writeJSON(w, &messageAPIResponse{MessageState: st, Disposition: disposition})
++}
++
++// publishActionMessage publishes a stock message_clear or message_delete event for an identity.
++// It mirrors handleActionMessage: same event, same sequence ID, same cache, same side effects.
++func (s *Server) publishActionMessage(v *visitor, topic, identity, event string) error {
++	t, err := s.topicFromID(v, topic)
++	if err != nil {
++		return err
++	}
++	m := model.NewActionMessage(event, topic, identity)
++	m.Sender = v.IP()
++	m.User = v.MaybeUserID()
++	m.Expires = time.Unix(m.Time, 0).Add(v.Limits().MessageExpiryDuration).Unix()
++	if err := s.dispatch(v, t, m, dispatchOpts{firebase: true, webPush: true}); err != nil {
++		return err
++	}
++	if err := s.messageCache.AddMessage(m); err != nil {
++		return err
++	}
++	s.mu.Lock()
++	s.messages++
++	s.mu.Unlock()
++	return nil
++}
+diff --git a/server/server.go b/server/server.go
+index c67e7417..27f13e6c 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -77,6 +77,7 @@ type Server struct {
+ 	messagesFlushed   int64                               // Value of the messages counter at the last stats flush; the difference is written as a delta
+ 	userManager       *user.Manager                       // Might be nil!
+ 	messageCache      *message.Cache                      // Database that stores the messages
++	messageRegistry   *message.Registry                   // Durable message identity, read/ack state, update/retract; nil if not configured
+ 	webPush           *webpush.Store                      // Database that stores web push subscriptions
+ 	attachment        *attachment.Store                   // Attachment store (file system or S3)
+ 	stripe            stripeAPI                           // Stripe API, can be replaced with a mock
+@@ -108,6 +109,7 @@ var (
+ 	updatePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}$`)
+ 	clearPathRegex         = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/(read|clear)$`)
+ 	deletePathRegex        = regexp.MustCompile(`^/[-_A-Za-z0-9]{1,64}/[-_A-Za-z0-9]{1,64}/delete$`)
++	messageAPIPathRegex    = regexp.MustCompile(`^/v1/messages/([-_A-Za-z0-9]{1,64})/([-_A-Za-z0-9]{1,64})(/ack)?$`)
+ 	sequenceIDRegex        = topicRegex
+ 
+ 	webAppConfigPath              = "/config.js"
+@@ -241,6 +243,14 @@ func New(conf *Config) (*Server, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	var msgRegistry *message.Registry
++	if conf.MessageRegistryFile != "" {
++		msgRegistry, err = message.NewRegistry(conf.MessageRegistryFile, conf.MessageRegistryDuration)
++		if err != nil {
++			messageCache.Close()
++			return nil, err
++		}
++	}
+ 	var wp *webpush.Store
+ 	if conf.WebPushPublicKey != "" {
+ 		if pool != nil {
+@@ -298,6 +308,7 @@ func New(conf *Config) (*Server, error) {
+ 		config:          conf,
+ 		db:              pool,
+ 		messageCache:    messageCache,
++		messageRegistry: msgRegistry,
+ 		webPush:         wp,
+ 		attachment:      attachmentStore,
+ 		twilio:          twilioClient,
+@@ -673,6 +684,9 @@ func (s *Server) closeDatabases() {
+ 	if s.messageCache != nil {
+ 		s.messageCache.Close()
+ 	}
++	if s.messageRegistry != nil {
++		s.messageRegistry.Close()
++	}
+ 	if s.userManager != nil {
+ 		s.userManager.Close()
+ 	}
+@@ -873,6 +887,8 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, v *visit
+ 		return s.ensureWebPushEnabled(s.limitRequests(s.handleWebPushDelete))(w, r, v)
+ 	} else if r.Method == http.MethodGet && r.URL.Path == apiStatsPath {
+ 		return s.handleStats(w, r, v)
++	} else if messageAPIPathRegex.MatchString(r.URL.Path) {
++		return s.limitRequests(s.handleMessageAPI)(w, r, v)
+ 	} else if r.Method == http.MethodGet && r.URL.Path == apiAccountBillingTiersPath {
+ 		return s.ensurePaymentsEnabled(s.handleBillingTiersGet)(w, r, v)
+ 	} else if r.Method == http.MethodGet && r.URL.Path == apiTiersPath {
+@@ -1225,6 +1241,11 @@ func (s *Server) handlePublishInternal(w http.ResponseWriter, r *http.Request, v
+ 	s.mu.Lock()
+ 	s.messages++
+ 	s.mu.Unlock()
++	if s.messageRegistry != nil && m.Event == model.MessageEvent && !delayed {
++		if _, err := s.messageRegistry.Put(m); err != nil {
++			logvrm(v, r, m).Tag(tagPublish).Err(err).Warn("Unable to record message identity")
++		}
++	}
+ 	if unifiedpush {
+ 		metrics.UnifiedPushPublishedSuccess.Inc()
+ 	}
+@@ -1239,6 +1260,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, v *visito
+ 		return err
+ 	}
+ 	metrics.MessagesPublishedSuccess.Inc()
++	w.Header().Set("X-Ntfy-Sequence-ID", m.SequenceID)
+ 	return s.writeJSON(w, m.ForJSON())
+ }
+ 
+@@ -2332,6 +2354,11 @@ func (s *Server) sendDelayedMessage(v *visitor, m *model.Message) error {
+ 	if err := s.messageCache.MarkPublished(m); err != nil {
+ 		return err
+ 	}
++	if s.messageRegistry != nil && m.Event == model.MessageEvent {
++		if _, err := s.messageRegistry.Put(m); err != nil {
++			logvm(v, m).Err(err).Warn("Unable to record message identity")
++		}
++	}
+ 	return nil
+ }
+ 
+-- 
+2.53.0
+
